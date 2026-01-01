@@ -1,0 +1,394 @@
+---
+# Namespace for incident detection
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: incident-detection
+  labels:
+    name: incident-detection
+
+---
+# ServiceAccount for the watcher
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-incident-watcher
+  namespace: incident-detection
+
+---
+# ClusterRole with read permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-incident-watcher-role
+rules:
+  # Read pods across all namespaces
+  - apiGroups: [""]
+    resources: ["pods", "pods/status", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  
+  # Read events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  
+  # Read nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  
+  # Read deployments and replicasets
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  
+  # Read namespaces
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-incident-watcher-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-incident-watcher-role
+subjects:
+  - kind: ServiceAccount
+    name: k8s-incident-watcher
+    namespace: incident-detection
+
+---
+# ConfigMap with watcher configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watcher-config
+  namespace: incident-detection
+data:
+  config.yaml: |
+    # Kubernetes Incident Watcher Configuration
+    
+    # AWS Settings
+    aws_region: "eu-west-1"
+    
+    # Lambda function to invoke
+    lambda_function_name: "ai-incident-detector"
+    
+    # Watch settings
+    watch_namespaces:
+      - "default"
+      - "production"
+      - "staging"
+      # Add more namespaces to monitor
+    
+    # Incident detection rules
+    pod_failure_states:
+      - "Failed"
+      - "CrashLoopBackOff"
+      - "Error"
+      - "ImagePullBackOff"
+      - "ErrImagePull"
+      - "OOMKilled"
+      - "Unknown"
+    
+    # CPU threshold (percentage)
+    cpu_threshold: 80
+    
+    # Memory threshold (percentage)
+    memory_threshold: 85
+    
+    # How often to check metrics (seconds)
+    check_interval: 60
+    
+    # Debounce time - don't send duplicate alerts within this time (seconds)
+    debounce_seconds: 300
+
+---
+# Deployment for the incident watcher
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-incident-watcher
+  namespace: incident-detection
+  labels:
+    app: k8s-incident-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-incident-watcher
+  template:
+    metadata:
+      labels:
+        app: k8s-incident-watcher
+    spec:
+      serviceAccountName: k8s-incident-watcher
+      containers:
+        - name: watcher
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir boto3 kubernetes pyyaml requests &&
+              python /app/watcher.py
+          
+          env:
+            - name: AWS_REGION
+              value: "eu-west-1"
+            
+            - name: K8S_CLUSTER_NAME
+              value: "service-runner"
+          
+          volumeMounts:
+            - name: watcher-script
+              mountPath: /app
+            - name: config
+              mountPath: /config
+          
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      
+      volumes:
+        - name: watcher-script
+          configMap:
+            name: watcher-script
+        - name: config
+          configMap:
+            name: watcher-config
+
+---
+# ConfigMap containing the watcher Python script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watcher-script
+  namespace: incident-detection
+data:
+  watcher.py: |
+    #!/usr/bin/env python3
+    """
+    Kubernetes Incident Watcher
+    Monitors K8s cluster for incidents and sends events to EventBridge
+    """
+    import os
+    import sys
+    import time
+    import json
+    import boto3
+    import logging
+    from datetime import datetime, timedelta
+    from kubernetes import client, config, watch
+    from typing import Dict, Set
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    class K8sIncidentWatcher:
+        """Watches Kubernetes cluster for incidents"""
+        
+        def __init__(self):
+            """Initialize the watcher"""
+            # Load K8s config
+            try:
+                config.load_incluster_config()
+                logger.info("✅ Loaded in-cluster Kubernetes config")
+            except:
+                config.load_kube_config()
+                logger.info("✅ Loaded local kubeconfig")
+            
+            # Initialize K8s clients
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+            # Initialize AWS EventBridge client (instead of Lambda)
+            self.events_client = boto3.client(
+                'events',
+                region_name=os.environ.get('AWS_REGION', 'eu-west-1')
+            )
+            
+            # Configuration
+            self.cluster_name = os.environ.get('K8S_CLUSTER_NAME', 'unknown')
+            self.check_interval = int(os.environ.get('CHECK_INTERVAL', '60'))
+            
+            # Track recent alerts to avoid duplicates
+            self.recent_alerts: Set[str] = set()
+            self.alert_cache_duration = timedelta(minutes=5)
+            
+            logger.info(f"🚀 K8s Incident Watcher initialized")
+            logger.info(f"📍 Cluster: {self.cluster_name}")
+            logger.info(f"🎯 Target: EventBridge → Lambda")
+            logger.info(f"⏱️  Check interval: {self.check_interval}s")
+        
+        def send_to_eventbridge(self, incident_data: Dict):
+            """Send incident to EventBridge (which routes to Lambda)"""
+            try:
+                # Create unique incident key for deduplication
+                incident_key = f"{incident_data.get('pod_name', '')}_{incident_data.get('reason', '')}"
+                
+                # Check if we've already sent this alert recently
+                if incident_key in self.recent_alerts:
+                    logger.debug(f"⏭️  Skipping duplicate alert: {incident_key}")
+                    return
+                
+                # Send to EventBridge
+                response = self.events_client.put_events(
+                    Entries=[{
+                        'Source': 'k8s.cluster',
+                        'DetailType': 'K8s Pod Failure',
+                        'Detail': json.dumps(incident_data),
+                        'EventBusName': 'default'
+                    }]
+                )
+                
+                # Check for failures
+                if response.get('FailedEntryCount', 0) > 0:
+                    logger.error(f"❌ Failed to send event: {response['Entries']}")
+                    return
+                
+                # Add to recent alerts cache
+                self.recent_alerts.add(incident_key)
+                
+                logger.info(f"✅ Sent incident to EventBridge: {incident_data.get('pod_name')} ({incident_data.get('reason')})")
+                
+            except Exception as e:
+                logger.error(f"❌ Error sending to EventBridge: {e}")
+        
+        def watch_pod_events(self):
+            """Watch for pod events in real-time"""
+            logger.info("👀 Starting pod event watcher...")
+            
+            w = watch.Watch()
+            
+            try:
+                # Watch all pods across all namespaces
+                for event in w.stream(self.v1.list_pod_for_all_namespaces, timeout_seconds=0):
+                    event_type = event['type']  # ADDED, MODIFIED, DELETED
+                    pod = event['object']
+                    
+                    # Check if pod is in a failure state
+                    if self._is_pod_failing(pod):
+                        incident_data = self._extract_pod_incident(pod)
+                        self.send_to_eventbridge(incident_data)
+            
+            except Exception as e:
+                logger.error(f"❌ Error watching pods: {e}")
+                logger.info("🔄 Restarting watcher in 10 seconds...")
+                time.sleep(10)
+                self.watch_pod_events()  # Restart
+        
+        def _is_pod_failing(self, pod) -> bool:
+            """Check if pod is in a failure state"""
+            # Check pod phase
+            phase = pod.status.phase
+            if phase in ['Failed', 'Unknown']:
+                return True
+            
+            # Check container statuses
+            if pod.status.container_statuses:
+                for container in pod.status.container_statuses:
+                    # Check waiting state
+                    if container.state.waiting:
+                        reason = container.state.waiting.reason
+                        if reason in ['CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError']:
+                            return True
+                    
+                    # Check terminated state
+                    if container.state.terminated:
+                        reason = container.state.terminated.reason
+                        if reason in ['Error', 'OOMKilled']:
+                            return True
+                    
+                    # Check restart count
+                    if container.restart_count > 5:
+                        return True
+            
+            return False
+        
+        def _extract_pod_incident(self, pod) -> Dict:
+            """Extract incident details from pod"""
+            # Get container status details
+            reason = "Unknown"
+            message = ""
+            status_type = "Unknown"
+            
+            if pod.status.container_statuses:
+                for container in pod.status.container_statuses:
+                    if container.state.waiting:
+                        reason = container.state.waiting.reason or "Unknown"
+                        message = container.state.waiting.message or ""
+                        status_type = "Waiting"
+                    elif container.state.terminated:
+                        reason = container.state.terminated.reason or "Unknown"
+                        message = container.state.terminated.message or ""
+                        status_type = "Terminated"
+            
+            # Build incident data
+            incident = {
+                "source": "kubernetes",
+                "type": "pod_failure",
+                "timestamp": datetime.utcnow().isoformat(),
+                "cluster_name": self.cluster_name,
+                "pod_name": pod.metadata.name,
+                "namespace": pod.metadata.namespace,
+                "status": pod.status.phase,
+                "reason": reason,
+                "message": message,
+                "status_type": status_type,
+                "restart_count": sum(c.restart_count for c in (pod.status.container_statuses or [])),
+                "labels": pod.metadata.labels or {},
+                "node_name": pod.spec.node_name or "unknown"
+            }
+            
+            return incident
+        
+        def check_resource_usage(self):
+            """Check for high CPU/memory usage (requires metrics-server)"""
+            logger.info("📊 Checking resource usage...")
+            
+            try:
+                # This requires metrics-server to be installed
+                # For now, we'll skip this and focus on event-based detection
+                # In production, you'd query metrics-server or Prometheus
+                pass
+            
+            except Exception as e:
+                logger.debug(f"Metrics check skipped: {e}")
+        
+        def cleanup_alert_cache(self):
+            """Clean up old alerts from cache"""
+            # Simple implementation - clear all every 5 minutes
+            self.recent_alerts.clear()
+            logger.debug("🧹 Cleaned alert cache")
+        
+        def run(self):
+            """Main run loop"""
+            logger.info("🎬 Starting K8s Incident Watcher")
+            
+            # Start watching pod events
+            self.watch_pod_events()
+    
+    
+    if __name__ == "__main__":
+        try:
+            watcher = K8sIncidentWatcher()
+            watcher.run()
+        except KeyboardInterrupt:
+            logger.info("👋 Watcher stopped by user")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"💥 Fatal error: {e}")
+            sys.exit(1)
