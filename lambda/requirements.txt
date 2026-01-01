@@ -1,0 +1,13 @@
+# AWS and cloud integrations
+boto3
+anthropic
+
+# Notifications
+slack-sdk
+requests
+
+# Kubernetes integration
+kubernetes
+
+# Utilities
+python-json-logger
