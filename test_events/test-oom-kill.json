@@ -1,0 +1,7 @@
+[
+    {
+      "Source": "k8s.production",
+      "DetailType": "K8s Pod Failure",
+      "Detail": "{\"source\":\"kubernetes\",\"type\":\"pod_failure\",\"timestamp\":\"2025-01-01T11:15:00Z\",\"cluster_name\":\"production-eks\",\"pod_name\":\"api-server-6c8d9f-abc\",\"namespace\":\"production\",\"status\":\"Failed\",\"reason\":\"OOMKilled\",\"message\":\"Container killed due to out of memory\",\"restart_count\":3,\"node_name\":\"ip-10-0-1-78.ec2.internal\",\"container_name\":\"api-server\",\"memory_limit\":\"512Mi\"}"
+    }
+  ]
